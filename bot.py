@@ -87,7 +87,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await save_or_update_user(user)
 
     # Send a confirmation message
-    await update.message.reply_text("✅ Thank you! You are now registered and will receive all future updates.")
+    await update.message.reply_text("✅ Thank you! Bot is updated and will receive all future updates.")
 
 async def confirmation_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles the click from the 'Confirm you are not a robot' button."""
