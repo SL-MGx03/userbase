@@ -5,7 +5,7 @@ import time
 from datetime import datetime
 from dotenv import load_dotenv
 from pymongo import MongoClient
-from pymongo.errors import ConnectionFailure
+from pymongo.errors import ConnectionFailure, ConfigurationError
 
 from telegram import Update, WebAppInfo, InputFile
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -20,12 +20,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- (IMPROVED) Environment Variable and Database Setup ---
-# We check each variable individually now to give a better error message.
+# --- Environment Variable Setup ---
 def get_env_var(var_name):
     value = os.getenv(var_name)
     if not value:
-        # This is a critical failure, so we raise an error to stop the bot.
         raise ValueError(f"CRITICAL ERROR: The environment variable '{var_name}' is not set.")
     return value
 
@@ -35,24 +33,31 @@ try:
     MONGO_DATABASE_URL = get_env_var("MONGO_DATABASE_URL")
 except ValueError as e:
     logger.error(e)
-    # Exit cleanly if a variable is missing.
     exit(1)
 
 CURRENT_USER_LOGIN = "SL-MGx03"
-
-# Convert admin IDs to a set for fast checking
 SUDO_OWNER_IDS = set(map(int, SUDO_TELEGRAM_IDS_STR.split(',')))
 
-# --- MongoDB Connection ---
+# --- (IMPROVED) MongoDB Connection ---
 try:
     client = MongoClient(MONGO_DATABASE_URL)
-    db = client.get_database() 
+    
+    # The line below is the fix.
+    # We explicitly select the database named 'sltoon_bot_db'.
+    # If this database doesn't exist, MongoDB will create it automatically on the first write.
+    db = client['sltoon_bot_db']
+    
     telegram_users_collection = db.telegram_users
+    
+    # Verify the connection is successful.
     client.admin.command('ping')
-    logger.info("MongoDB connection successful.")
-except ConnectionFailure as e:
-    logger.error(f"MongoDB connection failed: {e}")
-    raise
+    logger.info(f"MongoDB connection successful to database '{db.name}'.")
+
+except (ConnectionFailure, ConfigurationError) as e:
+    logger.error(f"MongoDB connection or configuration failed: {e}")
+    logger.error("Please ensure your MONGO_DATABASE_URL is correct and that the cluster is active.")
+    exit(1)
+
 
 # --- Helper Function to Check for Admin ---
 def is_admin(user_id: int) -> bool:
@@ -60,19 +65,15 @@ def is_admin(user_id: int) -> bool:
 
 # --- User Data Handling (Existing Feature) ---
 async def save_or_update_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Saves or updates user data in MongoDB using an efficient 'upsert'."""
     user = update.effective_user
-    if not user:
-        return
+    if not user: return
     try:
         telegram_users_collection.update_one(
             {'telegram_id': user.id},
             {
                 '$set': {
-                    'first_name': user.first_name,
-                    'last_name': user.last_name,
-                    'username': user.username,
-                    'is_bot': user.is_bot,
+                    'first_name': user.first_name, 'last_name': user.last_name,
+                    'username': user.username, 'is_bot': user.is_bot,
                     'updated_at': datetime.utcnow()
                 },
                 '$setOnInsert': { 'telegram_id': user.id, 'created_at': datetime.utcnow() }
@@ -85,7 +86,6 @@ async def save_or_update_user(update: Update, context: ContextTypes.DEFAULT_TYPE
 # --- Bot Command Handlers ---
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles the /start command and shows the Web App button."""
     await update.message.reply_text(
         "Welcome! Tap the button below to open the SL Toon Web App.",
         reply_markup={
@@ -96,12 +96,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Checks bot and database latency."""
     start_time = time.monotonic()
     message = await update.message.reply_text("Pinging...")
-    
     bot_latency = (time.monotonic() - start_time) * 1000
-    
     db_start_time = time.monotonic()
     try:
         db.command('ping')
@@ -110,15 +107,9 @@ async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Database ping failed: {e}")
         db_status = "Database ping: FAILED"
-        
-    await message.edit_text(
-        f"Pong! 🏓\n\n"
-        f"Bot latency: {bot_latency:.2f} ms\n"
-        f"{db_status}"
-    )
+    await message.edit_text(f"Pong! 🏓\n\nBot latency: {bot_latency:.2f} ms\n{db_status}")
 
 async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin command: sends a .txt file of all user IDs from MongoDB."""
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Access Denied. This command is for sudo owners only.")
         return
@@ -137,7 +128,6 @@ async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("An error occurred while generating the report.")
 
 async def full_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin command: sends a detailed .txt report of all users from MongoDB."""
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Access Denied. This command is for sudo owners only.")
         return
@@ -161,14 +151,11 @@ async def full_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Main Bot Setup ---
 def main():
-    """Start the bot."""
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("ping", ping_command))
     application.add_handler(CommandHandler("id", id_command))
     application.add_handler(CommandHandler("full", full_command))
-    
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, save_or_update_user))
 
     utc_time_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
