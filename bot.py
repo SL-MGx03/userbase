@@ -1,77 +1,81 @@
 import os
 import io
 import logging
+from datetime import datetime
 from dotenv import load_dotenv
+from pymongo import MongoClient
+from pymongo.errors import ConnectionFailure
 
 from telegram import Update, WebAppInfo, InputFile
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-from models import SessionLocal, TelegramUser, init_db
-
 # Load environment variables from a .env file for local development
 load_dotenv()
 
-# Set up logging to see bot activity and errors
+# --- Logging Setup ---
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# --- Environment Variable Validation ---
+# --- Environment Variable and Database Setup ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 SUDO_TELEGRAM_IDS_STR = os.getenv("SUDO_TELEGRAM_IDS")
+MONGO_DATABASE_URL = os.getenv("MONGO_DATABASE_URL")
 
-if not TELEGRAM_BOT_TOKEN or not SUDO_TELEGRAM_IDS_STR:
-    raise ValueError("TELEGRAM_BOT_TOKEN and SUDO_TELEGRAM_IDS must be set in environment variables.")
+if not all([TELEGRAM_BOT_TOKEN, SUDO_TELEGRAM_IDS_STR, MONGO_DATABASE_URL]):
+    raise ValueError("One or more required environment variables are not set.")
 
-# Convert the comma-separated string of IDs into a set of integers for fast lookups
+# Convert admin IDs to a set for fast checking
 SUDO_OWNER_IDS = set(map(int, SUDO_TELEGRAM_IDS_STR.split(',')))
 
+# --- MongoDB Connection ---
+try:
+    # This is the new connection logic for MongoDB
+    client = MongoClient(MONGO_DATABASE_URL)
+    # The database name will be taken from your connection string, or you can specify it
+    db = client.get_database() 
+    telegram_users_collection = db.telegram_users
+    # The following line verifies that the connection is successful.
+    client.admin.command('ping')
+    logger.info("MongoDB connection successful.")
+except ConnectionFailure as e:
+    logger.error(f"MongoDB connection failed: {e}")
+    raise
 
 # --- Helper Function to Check for Admin ---
 def is_admin(user_id: int) -> bool:
-    """Checks if a user's ID is in the list of sudo owners."""
     return user_id in SUDO_OWNER_IDS
-
 
 # --- User Data Handling ---
 async def save_or_update_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    This function runs on every message to save user data to the database.
-    It's our middleware for user tracking.
-    """
+    """Saves or updates user data in MongoDB using an efficient 'upsert'."""
     user = update.effective_user
     if not user:
         return
 
-    db_session = SessionLocal()
     try:
-        db_user = db_session.query(TelegramUser).filter(TelegramUser.telegram_id == user.id).first()
-
-        if db_user:
-            # User exists, update their info if it has changed
-            db_user.first_name = user.first_name
-            db_user.last_name = user.last_name
-            db_user.username = user.username
-        else:
-            # User is new, create a new record
-            new_user = TelegramUser(
-                telegram_id=user.id,
-                first_name=user.first_name,
-                last_name=user.last_name,
-                username=user.username,
-                is_bot=user.is_bot
-            )
-            db_session.add(new_user)
-        
-        db_session.commit()
+        # update_one with upsert=True is the perfect "find and update, or create if not found" operation
+        telegram_users_collection.update_one(
+            {'telegram_id': user.id},
+            {
+                '$set': {
+                    'first_name': user.first_name,
+                    'last_name': user.last_name,
+                    'username': user.username,
+                    'is_bot': user.is_bot,
+                    'updated_at': datetime.utcnow()
+                },
+                '$setOnInsert': {
+                    'telegram_id': user.id,
+                    'created_at': datetime.utcnow()
+                }
+            },
+            upsert=True
+        )
     except Exception as e:
-        logger.error(f"Database error in save_or_update_user: {e}")
-        db_session.rollback()
-    finally:
-        db_session.close()
-
+        logger.error(f"MongoDB error in save_or_update_user: {e}")
 
 # --- Bot Command Handlers ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -80,81 +84,65 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Welcome! Tap the button below to open the SL Toon Web App.",
         reply_markup={
             "inline_keyboard": [[
-                {
-                    "text": "🚀 Open SL Toon",
-                    "web_app": WebAppInfo(url="https://sltoon.slmgx.live")
-                }
+                {"text": "🚀 Open SL Toon", "web_app": WebAppInfo(url="https://sltoon.slmgx.live")}
             ]]
         }
     )
 
 async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin command: sends a .txt file of all user IDs."""
+    """Admin command: sends a .txt file of all user IDs from MongoDB."""
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Access Denied. This command is for sudo owners only.")
         return
 
-    db_session = SessionLocal()
     try:
-        users = db_session.query(TelegramUser.telegram_id).all()
-        if not users:
+        # Find all documents, but only return the 'telegram_id' field
+        users_cursor = telegram_users_collection.find({}, {'telegram_id': 1, '_id': 0})
+        user_ids = [str(doc['telegram_id']) for doc in users_cursor]
+
+        if not user_ids:
             await update.message.reply_text("No users found in the database yet.")
             return
 
-        user_ids = ", ".join(str(user.telegram_id) for user in users)
-        
-        # Create an in-memory file
-        file_buffer = io.BytesIO(user_ids.encode('utf-8'))
+        report_content = ", ".join(user_ids)
+        file_buffer = io.BytesIO(report_content.encode('utf-8'))
         file_buffer.name = 'telegram_user_ids.txt'
         
         await update.message.reply_document(document=InputFile(file_buffer))
-
     except Exception as e:
         logger.error(f"Error in /id command: {e}")
         await update.message.reply_text("An error occurred while generating the report.")
-    finally:
-        db_session.close()
 
 async def full_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin command: sends a detailed .txt report of all users."""
+    """Admin command: sends a detailed .txt report of all users from MongoDB."""
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Access Denied. This command is for sudo owners only.")
         return
 
-    db_session = SessionLocal()
     try:
-        users = db_session.query(TelegramUser).all()
-        if not users:
+        users_cursor = telegram_users_collection.find({})
+        report_lines = []
+        for user in users_cursor:
+            full_name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
+            username = f"@{user.get('username')}" if user.get('username') else "N/A"
+            report_lines.append(f"{full_name}, {username}, {user.get('telegram_id')}")
+
+        if not report_lines:
             await update.message.reply_text("No users found in the database yet.")
             return
-
-        report_lines = []
-        for user in users:
-            full_name = f"{user.first_name} {user.last_name or ''}".strip()
-            username = f"@{user.username}" if user.username else "N/A"
-            report_lines.append(f"{full_name}, {username}, {user.telegram_id}")
-
+            
         report_content = "\n".join(report_lines)
-        
-        # Create an in-memory file
         file_buffer = io.BytesIO(report_content.encode('utf-8'))
         file_buffer.name = 'full_user_report.txt'
         
         await update.message.reply_document(document=InputFile(file_buffer))
-
     except Exception as e:
         logger.error(f"Error in /full command: {e}")
         await update.message.reply_text("An error occurred while generating the report.")
-    finally:
-        db_session.close()
-
 
 # --- Main Bot Setup ---
 def main():
     """Start the bot."""
-    # First, ensure the database table exists.
-    init_db()
-
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     # Add handlers
@@ -165,9 +153,8 @@ def main():
     # This handler must be last. It catches all messages to save user data.
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, save_or_update_user))
 
-    logger.info("Bot is starting...")
+    logger.info(f"Bot for SL-MGx03 starting up... (UTC: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')})")
     application.run_polling()
-
 
 if __name__ == '__main__':
     main()
