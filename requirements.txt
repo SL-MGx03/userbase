@@ -1,9 +1,8 @@
 # For the Telegram Bot framework (modern async version)
 python-telegram-bot[ext]>=20.0
 
-# For connecting to the PostgreSQL database
-SQLAlchemy>=2.0
-psycopg2-binary
+# For connecting to the MongoDB database
+pymongo[srv]
 
 # For loading environment variables locally (optional but good practice)
 python-dotenv
