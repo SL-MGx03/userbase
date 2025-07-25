@@ -86,4 +86,92 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """(NEW) Checks bot and database latency."""
-    start_time = time.
+    start_time = time.monotonic()
+    message = await update.message.reply_text("Pinging...")
+    
+    # 1. Test Bot Latency
+    bot_latency = (time.monotonic() - start_time) * 1000
+    
+    # 2. Test Database Ping
+    db_start_time = time.monotonic()
+    try:
+        db.command('ping')
+        db_latency = (time.monotonic() - db_start_time) * 1000
+        db_status = f"Database ping: {db_latency:.2f} ms"
+    except Exception as e:
+        logger.error(f"Database ping failed: {e}")
+        db_status = "Database ping: FAILED"
+        
+    await message.edit_text(
+        f"Pong! 🏓\n\n"
+        f"Bot latency: {bot_latency:.2f} ms\n"
+        f"{db_status}"
+    )
+
+async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command: sends a .txt file of all user IDs from MongoDB."""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Access Denied. This command is for sudo owners only.")
+        return
+    try:
+        users_cursor = telegram_users_collection.find({}, {'telegram_id': 1, '_id': 0})
+        user_ids = [str(doc['telegram_id']) for doc in users_cursor]
+        if not user_ids:
+            await update.message.reply_text("No users found in the database yet.")
+            return
+        report_content = ", ".join(user_ids)
+        file_buffer = io.BytesIO(report_content.encode('utf-8'))
+        file_buffer.name = 'telegram_user_ids.txt'
+        await update.message.reply_document(document=InputFile(file_buffer))
+    except Exception as e:
+        logger.error(f"Error in /id command: {e}")
+        await update.message.reply_text("An error occurred while generating the report.")
+
+async def full_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command: sends a detailed .txt report of all users from MongoDB."""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Access Denied. This command is for sudo owners only.")
+        return
+    try:
+        users_cursor = telegram_users_collection.find({})
+        report_lines = []
+        for user in users_cursor:
+            full_name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
+            username = f"@{user.get('username')}" if user.get('username') else "N/A"
+            report_lines.append(f"{full_name}, {username}, {user.get('telegram_id')}")
+        if not report_lines:
+            await update.message.reply_text("No users found in the database yet.")
+            return
+        report_content = "\n".join(report_lines)
+        file_buffer = io.BytesIO(report_content.encode('utf-8'))
+        file_buffer.name = 'full_user_report.txt'
+        await update.message.reply_document(document=InputFile(file_buffer))
+    except Exception as e:
+        logger.error(f"Error in /full command: {e}")
+        await update.message.reply_text("An error occurred while generating the report.")
+
+# --- Main Bot Setup ---
+def main():
+    """Start the bot."""
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # Add handlers
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("ping", ping_command)) # (NEW)
+    application.add_handler(CommandHandler("id", id_command))
+    application.add_handler(CommandHandler("full", full_command))
+    
+    # This handler must be last. It catches all messages to save user data.
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, save_or_update_user))
+
+    # (NEW) Enhanced startup message
+    utc_time_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+    logger.info("==================================================")
+    logger.info(f"Bot starting up for user: {CURRENT_USER_LOGIN}")
+    logger.info(f"Startup Time (UTC): {utc_time_str}")
+    logger.info("==================================================")
+    
+    application.run_polling()
+
+if __name__ == '__main__':
+    main()
