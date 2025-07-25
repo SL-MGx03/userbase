@@ -20,14 +20,25 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- Environment Variable and Database Setup ---
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-SUDO_TELEGRAM_IDS_STR = os.getenv("SUDO_TELEGRAM_IDS")
-MONGO_DATABASE_URL = os.getenv("MONGO_DATABASE_URL")
-CURRENT_USER_LOGIN = "SL-MGx03" # As requested
+# --- (IMPROVED) Environment Variable and Database Setup ---
+# We check each variable individually now to give a better error message.
+def get_env_var(var_name):
+    value = os.getenv(var_name)
+    if not value:
+        # This is a critical failure, so we raise an error to stop the bot.
+        raise ValueError(f"CRITICAL ERROR: The environment variable '{var_name}' is not set.")
+    return value
 
-if not all([TELEGRAM_BOT_TOKEN, SUDO_TELEGRAM_IDS_STR, MONGO_DATABASE_URL]):
-    raise ValueError("One or more required environment variables are not set.")
+try:
+    TELEGRAM_BOT_TOKEN = get_env_var("TELEGRAM_BOT_TOKEN")
+    SUDO_TELEGRAM_IDS_STR = get_env_var("SUDO_TELEGRAM_IDS")
+    MONGO_DATABASE_URL = get_env_var("MONGO_DATABASE_URL")
+except ValueError as e:
+    logger.error(e)
+    # Exit cleanly if a variable is missing.
+    exit(1)
+
+CURRENT_USER_LOGIN = "SL-MGx03"
 
 # Convert admin IDs to a set for fast checking
 SUDO_OWNER_IDS = set(map(int, SUDO_TELEGRAM_IDS_STR.split(',')))
@@ -85,14 +96,12 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """(NEW) Checks bot and database latency."""
+    """Checks bot and database latency."""
     start_time = time.monotonic()
     message = await update.message.reply_text("Pinging...")
     
-    # 1. Test Bot Latency
     bot_latency = (time.monotonic() - start_time) * 1000
     
-    # 2. Test Database Ping
     db_start_time = time.monotonic()
     try:
         db.command('ping')
@@ -155,16 +164,13 @@ def main():
     """Start the bot."""
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Add handlers
     application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("ping", ping_command)) # (NEW)
+    application.add_handler(CommandHandler("ping", ping_command))
     application.add_handler(CommandHandler("id", id_command))
     application.add_handler(CommandHandler("full", full_command))
     
-    # This handler must be last. It catches all messages to save user data.
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, save_or_update_user))
 
-    # (NEW) Enhanced startup message
     utc_time_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
     logger.info("==================================================")
     logger.info(f"Bot starting up for user: {CURRENT_USER_LOGIN}")
