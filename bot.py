@@ -7,8 +7,8 @@ from dotenv import load_dotenv
 from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure, ConfigurationError
 
-from telegram import Update, WebAppInfo, InputFile
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, WebAppInfo, InputFile, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 # Load environment variables from a .env file for local development
 load_dotenv()
@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 # --- Environment Variable Setup ---
 def get_env_var(var_name):
+    """Gets an environment variable or raises an error if it's not found."""
     value = os.getenv(var_name)
     if not value:
         raise ValueError(f"CRITICAL ERROR: The environment variable '{var_name}' is not set.")
@@ -38,37 +39,28 @@ except ValueError as e:
 CURRENT_USER_LOGIN = "SL-MGx03"
 SUDO_OWNER_IDS = set(map(int, SUDO_TELEGRAM_IDS_STR.split(',')))
 
-# --- (IMPROVED) MongoDB Connection ---
+# --- MongoDB Connection ---
 try:
     client = MongoClient(MONGO_DATABASE_URL)
-    
-    # The line below is the fix.
-    # We explicitly select the database named 'sltoon_bot_db'.
-    # If this database doesn't exist, MongoDB will create it automatically on the first write.
-    db = client['sltoon_bot_db']
-    
+    db = client['sltoon_bot_db'] # Explicitly select the database
     telegram_users_collection = db.telegram_users
-    
-    # Verify the connection is successful.
+    # Verify connection
     client.admin.command('ping')
     logger.info(f"MongoDB connection successful to database '{db.name}'.")
-
 except (ConnectionFailure, ConfigurationError) as e:
     logger.error(f"MongoDB connection or configuration failed: {e}")
-    logger.error("Please ensure your MONGO_DATABASE_URL is correct and that the cluster is active.")
     exit(1)
 
-
-# --- Helper Function to Check for Admin ---
+# --- Core Helper Functions ---
 def is_admin(user_id: int) -> bool:
+    """Checks if a user's ID is in the list of sudo owners."""
     return user_id in SUDO_OWNER_IDS
 
-# --- User Data Handling (Existing Feature) ---
-async def save_or_update_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
+async def save_or_update_user(user):
+    """Saves or updates a user's details in the MongoDB collection."""
     if not user: return
     try:
-        telegram_users_collection.update_one(
+        result = telegram_users_collection.update_one(
             {'telegram_id': user.id},
             {
                 '$set': {
@@ -78,24 +70,44 @@ async def save_or_update_user(update: Update, context: ContextTypes.DEFAULT_TYPE
                 },
                 '$setOnInsert': { 'telegram_id': user.id, 'created_at': datetime.utcnow() }
             },
-            upsert=True
+            upsert=True # This creates the user if they don't exist
         )
+        if result.upserted_id:
+             logger.info(f"New user saved: {user.first_name} (ID: {user.id})")
+        else:
+             logger.info(f"User updated: {user.first_name} (ID: {user.id})")
     except Exception as e:
-        logger.error(f"MongoDB error in save_or_update_user: {e}")
+        logger.error(f"MongoDB error in save_or_update_user for user {user.id}: {e}")
 
-# --- Bot Command Handlers ---
+# --- User-Facing Handlers ---
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Welcome! Tap the button below to open the SL Toon Web App.",
-        reply_markup={
-            "inline_keyboard": [[
-                {"text": "🚀 Open SL Toon", "web_app": WebAppInfo(url="https://sltoon.slmgx.live")}
-            ]]
-        }
-    )
+    """Handles the /start command. This is a primary way to register users."""
+    user = update.effective_user
+    await save_or_update_user(user)
+
+    # Send a confirmation message
+    await update.message.reply_text("✅ Thank you! You are now registered and will receive all future updates.")
+
+async def confirmation_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the click from the 'Confirm you are not a robot' button."""
+    query = update.callback_query
+    user = query.from_user
+    
+    # Acknowledge the button press to stop the loading icon
+    await query.answer()
+    
+    # Save the user's data
+    await save_or_update_user(user)
+    
+    # Edit the original message to show a confirmation
+    await query.edit_message_text(text="✅ Confirmed! Thank you for staying with us.")
+
+# --- SECURED Admin Commands ---
 
 async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to check bot and DB latency."""
+    if not is_admin(update.effective_user.id): return
     start_time = time.monotonic()
     message = await update.message.reply_text("Pinging...")
     bot_latency = (time.monotonic() - start_time) * 1000
@@ -110,14 +122,13 @@ async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await message.edit_text(f"Pong! 🏓\n\nBot latency: {bot_latency:.2f} ms\n{db_status}")
 
 async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Access Denied. This command is for sudo owners only.")
-        return
+    """Admin command to get a list of all user IDs."""
+    if not is_admin(update.effective_user.id): return
     try:
         users_cursor = telegram_users_collection.find({}, {'telegram_id': 1, '_id': 0})
         user_ids = [str(doc['telegram_id']) for doc in users_cursor]
         if not user_ids:
-            await update.message.reply_text("No users found in the database yet.")
+            await update.message.reply_text("The database is empty. No users have registered yet.")
             return
         report_content = ", ".join(user_ids)
         file_buffer = io.BytesIO(report_content.encode('utf-8'))
@@ -128,40 +139,53 @@ async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("An error occurred while generating the report.")
 
 async def full_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Access Denied. This command is for sudo owners only.")
-        return
+    """Admin command to get a detailed report of all users."""
+    if not is_admin(update.effective_user.id): return
     try:
         users_cursor = telegram_users_collection.find({})
-        report_lines = []
+        report_lines = [f"Full Name, Username, Telegram ID"]
+        user_count = 0
         for user in users_cursor:
+            user_count += 1
             full_name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
             username = f"@{user.get('username')}" if user.get('username') else "N/A"
             report_lines.append(f"{full_name}, {username}, {user.get('telegram_id')}")
-        if not report_lines:
-            await update.message.reply_text("No users found in the database yet.")
+        
+        if user_count == 0:
+            await update.message.reply_text("The database is empty. No users have registered yet.")
             return
+            
         report_content = "\n".join(report_lines)
         file_buffer = io.BytesIO(report_content.encode('utf-8'))
         file_buffer.name = 'full_user_report.txt'
-        await update.message.reply_document(document=InputFile(file_buffer))
+        await update.message.reply_document(
+            document=InputFile(file_buffer),
+            caption=f"Total users registered: {user_count}"
+        )
     except Exception as e:
         logger.error(f"Error in /full command: {e}")
         await update.message.reply_text("An error occurred while generating the report.")
 
 # --- Main Bot Setup ---
 def main():
+    """Starts the bot and sets up the handlers."""
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    
+    # --- Register Handlers ---
+    # 1. User registration handlers
     application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CallbackQueryHandler(confirmation_button_handler, pattern='^confirm_robot_check$'))
+    
+    # 2. Admin command handlers
     application.add_handler(CommandHandler("ping", ping_command))
     application.add_handler(CommandHandler("id", id_command))
     application.add_handler(CommandHandler("full", full_command))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, save_or_update_user))
 
     utc_time_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
     logger.info("==================================================")
     logger.info(f"Bot starting up for user: {CURRENT_USER_LOGIN}")
     logger.info(f"Startup Time (UTC): {utc_time_str}")
+    logger.info("Bot is now polling for updates...")
     logger.info("==================================================")
     
     application.run_polling()
